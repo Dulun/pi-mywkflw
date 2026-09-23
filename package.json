@@ -1,0 +1,23 @@
+{
+  "name": "pi-mywkflw",
+  "version": "0.1.0",
+  "description": "Standalone Pi leader-worker-reviewer workflow extension",
+  "type": "module",
+  "keywords": ["pi-package", "pi", "multi-agent", "workflow"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dulun/pi-mywkflw.git"
+  },
+  "homepage": "https://github.com/Dulun/pi-mywkflw",
+  "bugs": {
+    "url": "https://github.com/Dulun/pi-mywkflw/issues"
+  },
+  "pi": {
+    "extensions": ["./extensions/mywkflw.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
