@@ -159,6 +159,51 @@ function availableModels(ctx: ExtensionContext): Map<string, ModelLike> {
 	return new Map([...models.entries()].sort(([a], [b]) => a.localeCompare(b)));
 }
 
+function groupModelsByProvider(models: Map<string, ModelLike>): Map<string, string[]> {
+	const groups = new Map<string, string[]>();
+	for (const [ref, model] of models) {
+		const refs = groups.get(model.provider) ?? [];
+		refs.push(ref);
+		groups.set(model.provider, refs);
+	}
+	return new Map(
+		[...groups.entries()]
+			.map(([provider, refs]) => [provider, refs.sort((a, b) => a.localeCompare(b))] as const)
+			.sort(([a], [b]) => a.localeCompare(b)),
+	);
+}
+
+async function selectModelHierarchically(
+	ctx: ExtensionContext,
+	models: Map<string, ModelLike>,
+	title: string,
+): Promise<string | undefined> {
+	const groups = groupModelsByProvider(models);
+	const provider = await ctx.ui.select(`${title}：选择供应商`, [...groups.keys()]);
+	if (!provider) return undefined;
+
+	const refs = groups.get(provider) ?? [];
+	while (true) {
+		const query = await ctx.ui.input(`${title}：搜索 ${provider} 模型（可留空）`, "输入模型名称或关键词");
+		if (query === undefined) return undefined;
+
+		const needle = query.trim().toLowerCase();
+		const filtered = refs.filter((ref) => ref.toLowerCase().includes(needle));
+		if (filtered.length === 0) {
+			ctx.ui.notify(`没有匹配的 ${provider} 模型，请换一个关键词。`, "warning");
+			continue;
+		}
+
+		const labels = new Map<string, string>();
+		for (const ref of filtered) {
+			const id = models.get(ref)?.id ?? ref;
+			labels.set(labels.has(id) ? ref : id, ref);
+		}
+		const selected = await ctx.ui.select(`${title}：选择具体模型`, [...labels.keys()]);
+		if (selected) return labels.get(selected);
+	}
+}
+
 export default function myWorkflow(pi: ExtensionAPI) {
 	let activeConfig: WorkflowConfig | undefined;
 
@@ -201,16 +246,13 @@ export default function myWorkflow(pi: ExtensionAPI) {
 				ctx.ui.notify("没有可用模型。请先检查认证或用 /list-models 查看模型。", "error");
 				return;
 			}
-			const options = [...models.keys()];
-			const select = async (title: string): Promise<string | undefined> => ctx.ui.select(title, options);
-
-			const leader = await select("选择 Leader 模型（前台会话）");
+			const leader = await selectModelHierarchically(ctx, models, "Leader（前台会话）");
 			if (!leader) {
 				ctx.ui.notify("已取消 mywkflw 初始化。", "info");
 				return;
 			}
 
-			const worker = await select("选择 Worker 模型（后台实现，默认 max thinking）");
+			const worker = await selectModelHierarchically(ctx, models, "Worker（后台实现，默认 max thinking）");
 			if (!worker) {
 				ctx.ui.notify("已取消 mywkflw 初始化。", "info");
 				return;
@@ -221,7 +263,7 @@ export default function myWorkflow(pi: ExtensionAPI) {
 				return;
 			}
 
-			const reviewer = await select("选择 Reviewer 模型（后台顺序只读评审）");
+			const reviewer = await selectModelHierarchically(ctx, models, "Reviewer（后台顺序只读评审）");
 			if (!reviewer) {
 				ctx.ui.notify("已取消 mywkflw 初始化。", "info");
 				return;

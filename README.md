@@ -5,6 +5,7 @@
 ## 功能
 
 - `/mywkflw` 依次选择 Leader、Worker、Reviewer 模型
+- 模型选择按供应商分层，并支持关键词搜索
 - Leader 留在前台，Worker 和 Reviewer 在后台运行
 - 默认最多 3 轮顺序 review，不并行启动 Reviewer
 - Worker 默认使用 `max` thinking
