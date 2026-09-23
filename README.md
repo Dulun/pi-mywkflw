@@ -5,7 +5,8 @@
 ## 功能
 
 - `/mywkflw` 依次选择 Leader、Worker、Reviewer 模型
-- 模型选择按供应商分层，并支持关键词搜索
+- 模型选择按供应商分层，进入模型列表后即可直接输入关键词搜索
+- 严格 `modelScope` 不允许已选 Worker/Reviewer 时，会自动把 canonical model ref 写入生效配置
 - Leader 留在前台，Worker 和 Reviewer 在后台运行
 - 默认最多 3 轮顺序 review，不并行启动 Reviewer
 - Worker 默认使用 `max` thinking
@@ -45,4 +46,4 @@ pi -e ./extensions/mywkflw.ts
 
 ## 模型限制
 
-如果 `pi-subagents` 的 `modelScope` 开启了严格限制，Worker 和 Reviewer 必须选择允许列表中的模型。
+如果 `pi-subagents` 的 `modelScope` 开启了严格限制，选择未允许的 Worker 或 Reviewer 模型时，扩展会自动把 canonical model ref 写入生效配置；随后执行 `/reload`，再重新运行 `/mywkflw`。

@@ -1,8 +1,9 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Container, Input, Key, matchesKey, SelectList, Text, type SelectItem } from "@earendil-works/pi-tui";
 
 const CONFIG_TYPE = "mywkflw.config";
 const REVIEW_ROUNDS = 3 as const;
@@ -19,8 +20,18 @@ type WorkflowConfig = {
 };
 
 type ModelScope = {
+	settings: Record<string, unknown>;
+	settingsPath: string;
+	scope: Record<string, unknown>;
+	roleScope?: Record<string, unknown>;
 	globalAllow: string[];
 	roleAllow: string[];
+};
+
+type ScopeUpdate = {
+	changed: boolean;
+	path?: string;
+	error?: string;
 };
 
 function agentDir(): string {
@@ -59,27 +70,36 @@ function readJson(path: string): Record<string, unknown> | undefined {
 }
 
 function readModelScope(ctx: ExtensionContext, role: string): ModelScope | undefined {
-	const userSettings = readJson(join(agentDir(), "settings.json"));
+	const userSettingsPath = join(agentDir(), "settings.json");
+	const userSettings = readJson(userSettingsPath);
+	let settings = userSettings;
+	let settingsPath = userSettingsPath;
 	let scope: unknown = asRecord(asRecord(userSettings)?.subagents)?.modelScope;
 
 	if (ctx.isProjectTrusted()) {
-		const projectSettings = readJson(join(ctx.cwd, ".pi", "settings.json"));
+		const projectSettingsPath = join(ctx.cwd, ".pi", "settings.json");
+		const projectSettings = readJson(projectSettingsPath);
 		const projectSubagents = asRecord(projectSettings?.subagents);
 		if (projectSubagents && Object.prototype.hasOwnProperty.call(projectSubagents, "modelScope")) {
+			settings = projectSettings;
+			settingsPath = projectSettingsPath;
 			scope = projectSubagents.modelScope;
 		}
 	}
 
 	const scopeRecord = asRecord(scope);
-	if (!scopeRecord) return undefined;
+	if (!settings || !scopeRecord) return undefined;
 
-	const roleRecord = asRecord(asRecord(scopeRecord.agents)?.[role]);
-	const enforced = scopeRecord.enforce === true || roleRecord?.enforce === true;
+	const roleScope = asRecord(asRecord(scopeRecord.agents)?.[role]);
+	const enforced = scopeRecord.enforce === true || roleScope?.enforce === true;
 	if (!enforced) return undefined;
 
 	const globalAllow = strings(scopeRecord.allow);
-	const roleAllow = strings(roleRecord?.allow);
-	return globalAllow.length > 0 || roleAllow.length > 0 ? { globalAllow, roleAllow } : undefined;
+	const roleAllow = strings(roleScope?.allow);
+	if (globalAllow.length === 0 && roleAllow.length === 0 && scopeRecord.enforce !== true && roleScope?.enforce !== true) {
+		return undefined;
+	}
+	return { settings, settingsPath, scope: scopeRecord, roleScope, globalAllow, roleAllow };
 }
 
 function globMatches(value: string, pattern: string): boolean {
@@ -88,17 +108,36 @@ function globMatches(value: string, pattern: string): boolean {
 	return new RegExp(`^${escaped}$`, "i").test(value);
 }
 
-function scopeError(ctx: ExtensionContext, role: string, ref: string): string | undefined {
+function ensureModelAllowed(ctx: ExtensionContext, role: string, ref: string): ScopeUpdate {
 	const scope = readModelScope(ctx, role);
-	if (!scope) return undefined;
+	if (!scope) return { changed: false };
 
+	let changed = false;
 	if (scope.globalAllow.length > 0 && !scope.globalAllow.some((pattern) => globMatches(ref, pattern))) {
-		return `${role} 模型不在当前 modelScope.allow 中：${ref}`;
+		scope.globalAllow.push(ref);
+		scope.scope.allow = scope.globalAllow;
+		changed = true;
 	}
 	if (scope.roleAllow.length > 0 && !scope.roleAllow.some((pattern) => globMatches(ref, pattern))) {
-		return `${role} 模型不在当前 modelScope.agents.${role}.allow 中：${ref}`;
+		if (scope.roleScope) {
+			scope.roleAllow.push(ref);
+			scope.roleScope.allow = scope.roleAllow;
+			changed = true;
+		}
 	}
-	return undefined;
+	if (scope.globalAllow.length === 0 && scope.roleAllow.length === 0) {
+		scope.globalAllow.push(ref);
+		scope.scope.allow = scope.globalAllow;
+		changed = true;
+	}
+	if (!changed) return { changed: false };
+
+	try {
+		writeFileSync(scope.settingsPath, `${JSON.stringify(scope.settings, null, 2)}\n`);
+		return { changed: true, path: scope.settingsPath };
+	} catch (error) {
+		return { changed: false, error: error instanceof Error ? error.message : String(error) };
+	}
 }
 
 function isWorkflowConfig(value: unknown): value is WorkflowConfig {
@@ -173,6 +212,107 @@ function groupModelsByProvider(models: Map<string, ModelLike>): Map<string, stri
 	);
 }
 
+function modelItems(refs: string[], models: Map<string, ModelLike>): SelectItem[] {
+	return refs.map((ref) => {
+		const model = models.get(ref);
+		return {
+			value: ref,
+			label: model?.id ?? ref,
+			description: model && model.name !== model.id ? model.name : ref,
+		};
+	});
+}
+
+async function selectSearchableModel(
+	ctx: ExtensionContext,
+	models: Map<string, ModelLike>,
+	refs: string[],
+	title: string,
+	provider: string,
+): Promise<string | undefined> {
+	if (ctx.mode !== "tui") {
+		const query = await ctx.ui.input(`${title}：搜索 ${provider} 模型`, "直接输入关键词，可留空");
+		if (query === undefined) return undefined;
+		const needle = query.trim().toLowerCase();
+		const filtered = refs.filter((ref) => {
+			const model = models.get(ref);
+			return `${ref} ${model?.id ?? ""} ${model?.name ?? ""}`.toLowerCase().includes(needle);
+		});
+		const selected = await ctx.ui.select(`${title}：选择具体模型`, modelItems(filtered, models).map((item) => item.label));
+		return selected ? filtered.find((ref) => (models.get(ref)?.id ?? ref) === selected) : undefined;
+	}
+
+	const result = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+		const container = new Container();
+		const input = new Input({ prompt: "搜索: ", placeholder: "直接输入模型关键词" });
+		input.focused = true;
+		let selectList: SelectList;
+
+		const themeConfig = {
+			selectedPrefix: (text: string) => theme.fg("accent", text),
+			selectedText: (text: string) => theme.fg("accent", text),
+			description: (text: string) => theme.fg("muted", text),
+			scrollInfo: (text: string) => theme.fg("dim", text),
+			noMatch: (text: string) => theme.fg("warning", text),
+		};
+
+		const createList = (query: string): SelectList => {
+			const needle = query.trim().toLowerCase();
+			const filtered = refs.filter((ref) => {
+				const model = models.get(ref);
+				return `${ref} ${model?.id ?? ""} ${model?.name ?? ""}`.toLowerCase().includes(needle);
+			});
+			const list = new SelectList(modelItems(filtered, models), Math.max(1, Math.min(filtered.length, 10)), themeConfig);
+			list.onSelect = (item) => done(item.value);
+			list.onCancel = () => done(null);
+			return list;
+		};
+
+		const topBorder = new DynamicBorder((text) => theme.fg("accent", text));
+		const heading = new Text(theme.fg("accent", theme.bold(`${title} · ${provider}`)));
+		const hint = new Text(theme.fg("dim", "输入即时筛选 · ↑↓选择 · Enter确认 · Esc取消"));
+		const bottomBorder = new DynamicBorder((text) => theme.fg("accent", text));
+		selectList = createList("");
+
+		const mount = () => {
+			container.clear();
+			container.addChild(topBorder);
+			container.addChild(heading);
+			container.addChild(input);
+			container.addChild(selectList);
+			container.addChild(hint);
+			container.addChild(bottomBorder);
+		};
+		mount();
+
+		const refreshList = () => {
+			selectList = createList(input.getValue());
+			mount();
+			container.invalidate();
+			tui.requestRender();
+		};
+
+		return {
+			render(width: number) {
+				return container.render(width);
+			},
+			invalidate() {
+				container.invalidate();
+			},
+			handleInput(data: string) {
+				if (matchesKey(data, Key.up) || matchesKey(data, Key.down) || matchesKey(data, Key.enter) || matchesKey(data, Key.escape)) {
+					selectList.handleInput(data);
+					return;
+				}
+				input.handleInput(data);
+				refreshList();
+			},
+		};
+	});
+
+	return result ?? undefined;
+}
+
 async function selectModelHierarchically(
 	ctx: ExtensionContext,
 	models: Map<string, ModelLike>,
@@ -181,27 +321,7 @@ async function selectModelHierarchically(
 	const groups = groupModelsByProvider(models);
 	const provider = await ctx.ui.select(`${title}：选择供应商`, [...groups.keys()]);
 	if (!provider) return undefined;
-
-	const refs = groups.get(provider) ?? [];
-	while (true) {
-		const query = await ctx.ui.input(`${title}：搜索 ${provider} 模型（可留空）`, "输入模型名称或关键词");
-		if (query === undefined) return undefined;
-
-		const needle = query.trim().toLowerCase();
-		const filtered = refs.filter((ref) => ref.toLowerCase().includes(needle));
-		if (filtered.length === 0) {
-			ctx.ui.notify(`没有匹配的 ${provider} 模型，请换一个关键词。`, "warning");
-			continue;
-		}
-
-		const labels = new Map<string, string>();
-		for (const ref of filtered) {
-			const id = models.get(ref)?.id ?? ref;
-			labels.set(labels.has(id) ? ref : id, ref);
-		}
-		const selected = await ctx.ui.select(`${title}：选择具体模型`, [...labels.keys()]);
-		if (selected) return labels.get(selected);
-	}
+	return selectSearchableModel(ctx, models, groups.get(provider) ?? [], title, provider);
 }
 
 export default function myWorkflow(pi: ExtensionAPI) {
@@ -257,9 +377,13 @@ export default function myWorkflow(pi: ExtensionAPI) {
 				ctx.ui.notify("已取消 mywkflw 初始化。", "info");
 				return;
 			}
-			const workerError = scopeError(ctx, "worker", worker);
-			if (workerError) {
-				ctx.ui.notify(`${workerError}。请修改选择或调整 subagents.modelScope。`, "error");
+			const workerScope = ensureModelAllowed(ctx, "worker", worker);
+			if (workerScope.error) {
+				ctx.ui.notify(`无法自动更新 worker 的 modelScope：${workerScope.error}`, "error");
+				return;
+			}
+			if (workerScope.changed) {
+				ctx.ui.notify(`已自动把 Worker 模型加入 ${workerScope.path}；请执行 /reload 后重新运行 /mywkflw。`, "warning");
 				return;
 			}
 
@@ -268,9 +392,13 @@ export default function myWorkflow(pi: ExtensionAPI) {
 				ctx.ui.notify("已取消 mywkflw 初始化。", "info");
 				return;
 			}
-			const reviewerError = scopeError(ctx, "reviewer", reviewer);
-			if (reviewerError) {
-				ctx.ui.notify(`${reviewerError}。请修改选择或调整 subagents.modelScope。`, "error");
+			const reviewerScope = ensureModelAllowed(ctx, "reviewer", reviewer);
+			if (reviewerScope.error) {
+				ctx.ui.notify(`无法自动更新 reviewer 的 modelScope：${reviewerScope.error}`, "error");
+				return;
+			}
+			if (reviewerScope.changed) {
+				ctx.ui.notify(`已自动把 Reviewer 模型加入 ${reviewerScope.path}；请执行 /reload 后重新运行 /mywkflw。`, "warning");
 				return;
 			}
 
